@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linux in a tab</title>
+<meta name="description" content="A RISC-V emulator written from scratch in TypeScript that boots Linux 6.1 in the browser, with a course (in Spanish) that explains it piece by piece.">
+<link rel="stylesheet" href="../xterm.css">
+<link rel="stylesheet" href="../estilo.css">
+</head>
+<body>
+<a class="saltar" href="#contenido">Skip to content</a>
+<main id="contenido">
+  <header class="portada">
+    <p class="idioma"><a href="../" hreflang="es">Español</a></p>
+    <h1>Linux in a tab</h1>
+    <p class="entradilla">A 32-bit RISC-V emulator (RV32IMA) written from scratch in TypeScript boots no-MMU Linux 6.1
+    inside this page, with no server and no plugins. An eight-chapter course (in Spanish) explains it piece by piece.</p>
+  </header>
+
+  <section aria-labelledby="t-probar">
+    <h2 id="t-probar">Try it</h2>
+    <p>Press «Boot» and wait for <code>login:</code> (a few seconds; the image is 3.5 MB). User <code>root</code>,
+    no password. Try <code>uname -a</code>, <code>ls /</code> or <code>cat /proc/cpuinfo</code>.</p>
+    <div class="bar"><button id="boot" type="button">Boot</button><span id="status" role="status" aria-live="polite">stopped</span></div>
+    <div id="term" aria-label="Linux terminal"></div>
+  </section>
+
+  <section aria-labelledby="t-curso">
+    <h2 id="t-curso">The course (in Spanish)</h2>
+    <p>Each chapter links to the code it explains and ends with an exercise checked by the repository's tests.
+    Start with the <a href="../curso/index.html" hreflang="es">course index</a>.</p>
+    <ol class="capitulos">
+      {{CAPITULOS}}
+    </ol>
+  </section>
+
+  <section aria-labelledby="t-codigo">
+    <h2 id="t-codigo">The code</h2>
+    <p>Everything is in <a href="{{REPO}}">the repository</a>: the CPU (<code>src/cpu.ts</code>), a fast WebAssembly engine
+    generated from TypeScript (<code>src/fast.ts</code>), the devices, the device tree and the tests (76 riscv-tests and
+    booting Linux in Node and in Chromium).</p>
+  </section>
+</main>
+<footer>
+  <p>Emulator code: MIT license. Course text: CC BY 4.0. The Linux image this page boots (kernel 6.1.14 and busybox)
+  is GPL; its sources are listed in <a href="{{REPO}}/blob/main/CREDITOS.md">CREDITOS.md</a>.</p>
+  <p><a href="index.html">Home</a> · <a href="{{REPO}}">Source code</a></p>
+</footer>
+<script src="main.js"></script>
+</body>
+</html>

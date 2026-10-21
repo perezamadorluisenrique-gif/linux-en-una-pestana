@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linux en una pestaña</title>
+<meta name="description" content="Un emulador RISC-V escrito desde cero en TypeScript que arranca Linux 6.1 en el navegador, y un curso en español que lo explica pieza a pieza.">
+<link rel="stylesheet" href="xterm.css">
+<link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+<a class="saltar" href="#contenido">Saltar al contenido</a>
+<main id="contenido">
+  <header class="portada">
+    <p class="idioma"><a href="en/" hreflang="en">English</a></p>
+    <h1>Linux en una pestaña</h1>
+    <p class="entradilla">Un emulador RISC-V de 32 bits (RV32IMA) escrito desde cero en TypeScript arranca Linux 6.1 sin MMU
+    dentro de esta página, sin servidor y sin plugins. Un curso en español de ocho capítulos lo explica pieza a pieza.</p>
+  </header>
+
+  <section aria-labelledby="t-probar">
+    <h2 id="t-probar">Pruébalo</h2>
+    <p>Pulsa «Arrancar» y espera al <code>login:</code> (unos segundos; la imagen pesa 3,5 MB). Usuario <code>root</code>,
+    sin contraseña. Prueba <code>uname -a</code>, <code>ls /</code> o <code>cat /proc/cpuinfo</code>.</p>
+    <div class="bar"><button id="boot" type="button">Arrancar</button><span id="status" role="status" aria-live="polite">parado</span></div>
+    <div id="term" aria-label="Terminal de Linux"></div>
+  </section>
+
+  <section aria-labelledby="t-curso">
+    <h2 id="t-curso">El curso</h2>
+    <p>Cada capítulo enlaza al código que explica y termina con un ejercicio que se comprueba con las pruebas del repositorio.
+    Empieza por el <a href="curso/index.html">índice del curso</a>.</p>
+    <ol class="capitulos">
+      {{CAPITULOS}}
+    </ol>
+  </section>
+
+  <section aria-labelledby="t-codigo">
+    <h2 id="t-codigo">El código</h2>
+    <p>Todo está en <a href="{{REPO}}">el repositorio</a>: la CPU (<code>src/cpu.ts</code>), un motor rápido en WebAssembly
+    generado desde TypeScript (<code>src/fast.ts</code>), los dispositivos, el device tree y las pruebas (76 riscv-tests y el
+    arranque de Linux en Node y en Chromium).</p>
+  </section>
+</main>
+{{PIE}}
+<script src="main.js"></script>
+</body>
+</html>

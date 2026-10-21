@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Puntuación del reto (ver tools/score.ts).
+exec node "$(dirname "$0")/tools/score.ts" "$@"

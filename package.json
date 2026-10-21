@@ -1,0 +1,19 @@
+{
+  "name": "linux-en-una-pestana",
+  "private": true,
+  "type": "module",
+  "description": "Un emulador RISC-V escrito desde cero que arranca Linux en el navegador, con su curso",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "scripts": {
+    "imagen": "bash herramientas/obtener-imagen.sh",
+    "build": "node herramientas/construir.mjs",
+    "test": "node pruebas/arranque.mjs && node pruebas/arranque.mjs en/ && node pruebas/axe.mjs"
+  },
+  "devDependencies": {
+    "@xterm/xterm": "6.0.0",
+    "axe-core": "4.10.3",
+    "esbuild": "0.25.10",
+    "marked": "15.0.12",
+    "playwright": "1.56.0"
+  }
+}

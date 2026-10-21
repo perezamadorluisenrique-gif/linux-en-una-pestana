@@ -1,0 +1,6 @@
+build/
+node_modules/
+*.log
+web/dist/
+_site/
+pruebas/axe-informe.json

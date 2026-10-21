@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linux en una pestaña</title>
+<link rel="stylesheet" href="xterm.css">
+<style>
+  :root { --bg: #f6f6f3; --fg: #1d1d1b; --muted: #6b6b66; --accent: #2f6f4f; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #141413; --fg: #e8e8e3; --muted: #9a9a94; --accent: #6fbf8f; } }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  p { margin: 0 0 12px; color: var(--muted); }
+  .bar { display: flex; gap: 12px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  #status { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #term { background: #000; padding: 6px; border-radius: 6px; overflow: hidden; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Linux en una pestaña</h1>
+  <p>Un emulador RISC-V (RV32IMA) escrito desde cero en TypeScript arranca Linux 6.1 sin MMU dentro de esta página. Usuario <code>root</code>, sin contraseña.</p>
+  <div class="bar"><button id="boot">Arrancar</button><span id="status">parado</span></div>
+  <div id="term"></div>
+</main>
+<script src="main.js"></script>
+</body>
+</html>

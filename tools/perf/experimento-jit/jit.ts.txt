@@ -1,0 +1,194 @@
+// Traductor de bloques: convierte un trozo de código RISC-V en una función JavaScript.
+//
+// El intérprete (cpu.ts, `runInner`) paga en cada instrucción el fetch, el `switch`, leer los
+// operandos de `x[]` y escribir el resultado. Un bloque básico (instrucciones seguidas hasta
+// el primer salto) siempre hace lo mismo, así que lo "compilamos" una vez: generamos el texto
+// de una función JS con los registros en variables locales y las constantes ya resueltas, y
+// dejamos que el JIT de V8 la convierta en código máquina. Capítulo 8 del curso.
+//
+// Solo entran en un bloque las instrucciones "sencillas" (cálculo, cargas, stores, saltos).
+// SYSTEM (CSR, ECALL, MRET, WFI), las atómicas, FENCE.I y cualquier codificación ilegal
+// terminan el bloque antes de ellas: las ejecuta el intérprete, que ya sabe hacerlo.
+
+import { CAUSE, Trap, mulh, mulhsu, mulhu } from "./cpu.ts";
+
+/** Firma de un bloque compilado: devuelve el pc siguiente. */
+export type BlockFn = (
+  cpu: BlockHost, x: Int32Array, m8: Int8Array, m16: Int16Array, m32: Int32Array, u8: Uint8Array,
+  code: Uint8Array,
+) => number;
+
+/** Lo que un bloque necesita de la CPU: la ruta lenta de memoria y el estado que toca. */
+export interface BlockHost {
+  pc: number;
+  instret: number;
+  cycle: number;
+  reservation: number;
+  load8(a: number): number;
+  load16(a: number): number;
+  load32(a: number): number;
+  store8(a: number, v: number): void;
+  store16(a: number, v: number): void;
+  store32(a: number, v: number): void;
+  codeWrite(off: number): void;
+}
+
+export interface Block { fn: BlockFn; len: number; }
+
+/** Máximo de instrucciones por bloque y tamaño de las "páginas de código" (para invalidar). */
+export const MAX_BLOCK = 64;
+export const CODE_PAGE_SHIFT = 10; // 1 KiB
+/** Vueltas máximas de un bucle dentro de un bloque antes de devolver el control. */
+export const LOOP_MAX = 256;
+
+/**
+ * Compila el bloque que empieza en `pc`. `m32` es la RAM (empieza en `ramBase`).
+ * Devuelve null si la primera instrucción no se puede compilar.
+ */
+export function compileBlock(pc: number, m32: Int32Array, ramBase: number, ramSize: number): Block | null {
+  const RB = ramBase | 0;
+  const LIM = ramSize - 4;
+  const body: string[] = [];
+  const used = new Set<number>();
+  const written = new Set<number>();
+  const R = (i: number) => { if (i === 0) return "0"; used.add(i); return `r${i}`; };
+  const W = (i: number, expr: string) => {
+    if (i === 0) return `t = ${expr};`; // x0: se calcula (por si es una carga) y se descarta
+    used.add(i); written.add(i);
+    return `r${i} = ${expr};`;
+  };
+  const pageEnd = (((pc - RB) >>> CODE_PAGE_SHIFT) + 1) << CODE_PAGE_SHIFT;
+  let p = pc | 0;
+  let k = 0;
+  let end: string | null = null; // la sentencia final (return ...)
+
+  while (k < MAX_BLOCK) {
+    const off = ((p - RB) | 0) >>> 0;
+    if (off > LIM || off >= pageEnd) break; // fuera de la RAM o de la página: termina aquí
+    const insn = m32[off >>> 2];
+    const rd = (insn >>> 7) & 31, rs1 = (insn >>> 15) & 31, rs2 = (insn >>> 20) & 31;
+    const f3 = (insn >>> 12) & 7, f7 = insn >>> 25;
+    const next = (p + 4) | 0;
+    let code: string | null = null;
+
+    switch (insn & 0x7f) {
+      case 0x37: code = W(rd, `${insn & 0xfffff000}`); break;
+      case 0x17: code = W(rd, `${(p + (insn & 0xfffff000)) | 0}`); break;
+      case 0x6f: { // JAL: el destino se conoce al compilar
+        const imm = ((insn >> 31) << 20) | (((insn >>> 12) & 0xff) << 12) |
+          (((insn >>> 20) & 1) << 11) | (((insn >>> 21) & 0x3ff) << 1);
+        const target = (p + imm) | 0;
+        if (target & 3) break;
+        code = W(rd, `${next}`);
+        end = `k = ${k + 1}; return ${target};`;
+        break;
+      }
+      case 0x67: { // JALR
+        if (f3 !== 0) break;
+        code = `k = ${k}; tg = ((${R(rs1)} + ${insn >> 20}) & -2) | 0; ` +
+          `if (tg & 3) throw new Trap(${CAUSE.MISALIGNED_FETCH}, tg); ` + W(rd, `${next}`);
+        end = `k = ${k + 1}; return tg;`;
+        break;
+      }
+      case 0x63: { // BRANCH
+        const imm = ((insn >> 31) << 12) | (((insn >>> 7) & 1) << 11) |
+          (((insn >>> 25) & 0x3f) << 5) | (((insn >>> 8) & 0xf) << 1);
+        const target = (p + imm) | 0;
+        if (target & 3) break;
+        const a = R(rs1), b = R(rs2);
+        const cond = [`${a} === ${b}`, `${a} !== ${b}`, "", "", `${a} < ${b}`, `${a} >= ${b}`,
+          `(${a} >>> 0) < (${b} >>> 0)`, `(${a} >>> 0) >= (${b} >>> 0)`][f3];
+        if (!cond) break;
+        code = "";
+        end = target === (pc | 0)
+          // Un bucle que vuelve al principio del bloque (memset, memcpy, esperas...): da la vuelta
+          // aquí dentro, sin volver al despachador, hasta LOOP_MAX vueltas.
+          ? `if (${cond}) { d += ${k + 1}; if (++it < ${LOOP_MAX}) continue; return ${target}; } k = ${k + 1}; return ${next};`
+          : `k = ${k + 1}; return (${cond}) ? ${target} : ${next};`;
+        break;
+      }
+      case 0x03: { // LOAD
+        const ad = `k = ${k}; a = (${R(rs1)} + ${insn >> 20}) | 0; o = ((a - ${RB}) | 0) >>> 0; `;
+        const e = [
+          `o < ${ramSize} ? m8[o] : (cpu.load8(a) << 24) >> 24`,
+          `(o & 1) === 0 && o < ${ramSize} ? m16[o >>> 1] : (cpu.load16(a) << 16) >> 16`,
+          `(o & 3) === 0 && o <= ${LIM} ? m32[o >>> 2] : cpu.load32(a)`, "",
+          `o < ${ramSize} ? u8[o] : cpu.load8(a)`,
+          `(o & 1) === 0 && o < ${ramSize} ? m16[o >>> 1] & 0xffff : cpu.load16(a)`,
+        ][f3];
+        if (!e) break;
+        code = ad + W(rd, e);
+        break;
+      }
+      case 0x23: { // STORE: si la página tiene código compilado, se invalida
+        const imm = ((insn >> 25) << 5) | ((insn >>> 7) & 31);
+        const v = R(rs2);
+        const ad = `k = ${k}; a = (${R(rs1)} + ${imm}) | 0; o = ((a - ${RB}) | 0) >>> 0; `;
+        const inv = `if (code[o >>> ${CODE_PAGE_SHIFT}] !== 0) cpu.codeWrite(o);`;
+        const st = [
+          `if (o < ${ramSize}) { m8[o] = ${v}; ${inv} } else cpu.store8(a, ${v});`,
+          `if ((o & 1) === 0 && o < ${ramSize}) { m16[o >>> 1] = ${v}; ${inv} } else cpu.store16(a, ${v});`,
+          `if ((o & 3) === 0 && o <= ${LIM}) { m32[o >>> 2] = ${v}; ${inv} } else cpu.store32(a, ${v});`,
+        ][f3];
+        if (!st) break;
+        code = ad + st + " if (cpu.reservation === (a & -4)) cpu.reservation = -1;";
+        break;
+      }
+      case 0x13: { // OP-IMM
+        const imm = insn >> 20, a = R(rs1), sh = imm & 31;
+        let e: string | null = null;
+        switch (f3) {
+          case 0: e = `(${a} + ${imm}) | 0`; break;
+          case 1: if (f7 === 0) e = `${a} << ${sh}`; break;
+          case 2: e = `${a} < ${imm} ? 1 : 0`; break;
+          case 3: e = `(${a} >>> 0) < ${imm >>> 0} ? 1 : 0`; break;
+          case 4: e = `${a} ^ ${imm}`; break;
+          case 5: if (f7 === 0) e = `(${a} >>> ${sh}) | 0`; else if (f7 === 0x20) e = `${a} >> ${sh}`; break;
+          case 6: e = `${a} | ${imm}`; break;
+          case 7: e = `${a} & ${imm}`; break;
+        }
+        if (e) code = W(rd, e);
+        break;
+      }
+      case 0x33: { // OP y extensión M
+        const a = R(rs1), b = R(rs2);
+        let e: string | null = null;
+        if (f7 === 0) {
+          e = [`(${a} + ${b}) | 0`, `${a} << (${b} & 31)`, `${a} < ${b} ? 1 : 0`,
+            `(${a} >>> 0) < (${b} >>> 0) ? 1 : 0`, `${a} ^ ${b}`, `(${a} >>> (${b} & 31)) | 0`,
+            `${a} | ${b}`, `${a} & ${b}`][f3];
+        } else if (f7 === 0x20 && f3 === 0) e = `(${a} - ${b}) | 0`;
+        else if (f7 === 0x20 && f3 === 5) e = `${a} >> (${b} & 31)`;
+        else if (f7 === 1) {
+          e = [`Math.imul(${a}, ${b})`, `mulh(${a}, ${b})`, `mulhsu(${a}, ${b})`, `mulhu(${a}, ${b})`,
+            `${b} === 0 ? -1 : (${a} === -2147483648 && ${b} === -1) ? ${a} : (${a} / ${b}) | 0`,
+            `${b} === 0 ? -1 : ((${a} >>> 0) / (${b} >>> 0)) | 0`,
+            `${b} === 0 ? ${a} : (${a} === -2147483648 && ${b} === -1) ? 0 : (${a} % ${b}) | 0`,
+            `${b} === 0 ? ${a} : ((${a} >>> 0) % (${b} >>> 0)) | 0`][f3];
+        }
+        if (e) code = W(rd, e);
+        break;
+      }
+      case 0x0f: if (f3 === 0) code = ""; break; // FENCE: nada que hacer (FENCE.I va al intérprete)
+    }
+    if (code === null) break; // no compilable: el bloque acaba antes de esta instrucción
+    body.push(`/* ${(p >>> 0).toString(16)} */ ${code}`);
+    k++;
+    p = next;
+    if (end) break;
+  }
+  if (k === 0) return null;
+  if (!end) end = `k = ${k}; return ${p};`;
+
+  const regs = [...used].sort((a, b) => a - b);
+  const src =
+    `return function block_${(pc >>> 0).toString(16)}(cpu, x, m8, m16, m32, u8, code) {\n` +
+    (regs.length ? `  let ${regs.map((i) => `r${i} = x[${i}]`).join(", ")};\n` : "") +
+    `  let k = 0, d = 0, it = 0, t = 0, a = 0, o = 0, tg = 0;\n` +
+    `  try {\n  for (;;) {\n    k = 0;\n    ${body.join("\n    ")}\n    ${end}\n  }\n` +
+    `  } catch (e) { cpu.pc = (${pc | 0} + 4 * k) | 0; throw e; }\n` +
+    `  finally {\n    ${[...written].map((i) => `x[${i}] = r${i};`).join(" ")}\n` +
+    `    cpu.instret += d + k; cpu.cycle += d + k;\n  }\n};`;
+  const fn = new Function("Trap", "mulh", "mulhsu", "mulhu", src)(Trap, mulh, mulhsu, mulhu) as BlockFn;
+  return { fn, len: k };
+}

@@ -1,0 +1,293 @@
+--- /home/claude/reto-linux-pestana/src/cpu.ts	2026-10-20 14:20:51.176818914 +0000
++++ cpu-jit.ts	2026-10-20 14:16:40.736730364 +0000
+@@ -5,6 +5,7 @@
+ // excepciones a ese bucle. Capítulos 1 a 5 del curso.
+ 
+ import { Bus, BusError } from "./bus.ts";
++import { type Block, CODE_PAGE_SHIFT, compileBlock } from "./jit.ts";
+ 
+ // Causas de excepción (campo mcause, privileged spec §3.1.15).
+ export const CAUSE = {
+@@ -106,6 +107,8 @@
+     this.m8 = new Int8Array(buf);
+     this.m16 = new Int16Array(buf, 0, buf.byteLength >>> 1);
+     this.m32 = new Int32Array(buf, 0, buf.byteLength >>> 2);
++    this.codePages = new Uint8Array((bus.ramSize >>> CODE_PAGE_SHIFT) + 1);
++    this.pageBlocks = new Array(this.codePages.length);
+   }
+ 
+   reset(pc: number): void {
+@@ -141,22 +144,30 @@
+   }
+   store32(addr: number, v: number): void {
+     const off = (addr - this.bus.ramBase) >>> 0;
+-    if (off <= this.bus.ramSize - 4) { this.bus.view.setInt32(off, v, true); return; }
++    if (off <= this.bus.ramSize - 4) { this.bus.view.setInt32(off, v, true); this.touch(off, 4); return; }
+     if ((addr & 3) !== 0) throw new Trap(CAUSE.MISALIGNED_STORE, addr);
+     this.ioWrite(addr, v, 4);
+   }
+   store16(addr: number, v: number): void {
+     const off = (addr - this.bus.ramBase) >>> 0;
+-    if (off <= this.bus.ramSize - 2) { this.bus.view.setUint16(off, v & 0xffff, true); return; }
++    if (off <= this.bus.ramSize - 2) { this.bus.view.setUint16(off, v & 0xffff, true); this.touch(off, 2); return; }
+     if ((addr & 1) !== 0) throw new Trap(CAUSE.MISALIGNED_STORE, addr);
+     this.ioWrite(addr, v, 2);
+   }
+   store8(addr: number, v: number): void {
+     const off = (addr - this.bus.ramBase) >>> 0;
+-    if (off < this.bus.ramSize) { this.bus.ram[off] = v; return; }
++    if (off < this.bus.ramSize) { this.bus.ram[off] = v; this.touch(off, 1); return; }
+     this.ioWrite(addr, v, 1);
+   }
+ 
++  /** Una escritura en RAM: si cae en una página con bloques compilados, se invalidan. */
++  private touch(off: number, width: number): void {
++    const code = this.codePages;
++    if (code[off >>> CODE_PAGE_SHIFT] !== 0) this.codeWrite(off);
++    const last = off + width - 1;
++    if (code[last >>> CODE_PAGE_SHIFT] !== 0) this.codeWrite(last);
++  }
++
+   private io(addr: number, width: number, cause: number): number {
+     try {
+       return this.bus.readIO(addr, width);
+@@ -312,7 +323,7 @@
+     while (done < budget) {
+       if (this.waiting) break;
+       try {
+-        done += this.runInner(budget - done);
++        done += this.jitThreshold >= 0 ? this.runBlocks(budget - done) : this.runInner(budget - done, false);
+         if (this.breakOut) {
+           this.breakOut = false;
+           // Solo devolvemos el control a la máquina si de verdad puede haber algo que atender:
+@@ -332,6 +343,102 @@
+   }
+ 
+ 
++  // ---------------------------------------------------------------- bloques compilados (jit.ts)
++
++  /**
++   * Veces que el intérprete ejecuta un bloque antes de compilarlo (-1: nunca, solo intérprete).
++   * Compilar cuesta (generar texto y que V8 lo convierta), así que solo merece la pena
++   * para el código que se repite.
++   */
++  jitThreshold = 8;
++  private static readonly CACHE_BITS = 16;
++  /** Caché de correspondencia directa: pc -> bloque, indexada por los bits bajos del pc. */
++  private readonly tags = new Int32Array(1 << CPU.CACHE_BITS).fill(1);
++  private readonly blocks: (Block | null)[] = new Array(1 << CPU.CACHE_BITS).fill(null);
++  private readonly hot = new Uint16Array(1 << CPU.CACHE_BITS);
++  /** Todos los bloques compilados, por pc: si la caché pierde uno por conflicto, se recupera aquí. */
++  private readonly allBlocks = new Map<number, Block>();
++  /** Por cada página de 1 KiB de RAM: ¿hay bloques compilados con código de ella? */
++  private readonly codePages: Uint8Array;
++  private readonly pageBlocks: (number[] | undefined)[];
++  /** Bloques compilados desde el arranque (estadística). */
++  compiled = 0;
++
++  /** Alguien escribió en una página con código compilado: tira esos bloques. */
++  codeWrite(off: number): void {
++    const page = off >>> CODE_PAGE_SHIFT;
++    const list = this.pageBlocks[page];
++    this.codePages[page] = 0;
++    this.pageBlocks[page] = undefined;
++    if (!list) return;
++    const rb = this.bus.ramBase | 0;
++    const mask = (1 << CPU.CACHE_BITS) - 1;
++    for (const pc of list) {
++      this.allBlocks.delete(pc);
++      const i = (pc >>> 2) & mask;
++      if (this.tags[i] === pc) { this.tags[i] = 1; this.blocks[i] = null; }
++    }
++  }
++
++  /** FENCE.I: el programa avisa de que ha cambiado código. Tiramos todos los bloques. */
++  flushBlocks(): void {
++    this.tags.fill(1);
++    this.blocks.fill(null);
++    this.codePages.fill(0);
++    this.pageBlocks.fill(undefined);
++    this.allBlocks.clear();
++  }
++
++  /** Bucle con bloques: busca (o compila) el bloque del pc y lo ejecuta entero. */
++  private runBlocks(budget: number): number {
++    const x = this.x, m8 = this.m8, m16 = this.m16, m32 = this.m32, u8 = this.bus.ram;
++    const code = this.codePages, tags = this.tags, blocks = this.blocks;
++    const mask = (1 << CPU.CACHE_BITS) - 1;
++    let n = 0;
++    while (n < budget) {
++      const pc = this.pc;
++      const i = (pc >>> 2) & mask;
++      let b: Block | null;
++      if (tags[i] === pc) {
++        b = blocks[i];
++      } else if ((b = this.allBlocks.get(pc) ?? null) !== null) {
++        tags[i] = pc;
++        blocks[i] = b;
++      } else if (this.hot[i] < this.jitThreshold) {
++        this.hot[i]++;
++        b = null;
++      } else {
++        this.hot[i] = 0;
++        b = this.compile(pc, i);
++      }
++      if (b === null) {
++        // El intérprete, hasta el siguiente salto (o una instrucción que devuelve el control).
++        n += this.runInner(budget - n, true);
++        if (this.breakOut) return n;
++        continue;
++      }
++      const before = this.instret;
++      this.pc = b.fn(this, x, m8, m16, m32, u8, code);
++      n += this.instret - before;
++    }
++    return n;
++  }
++
++  private compile(pc: number, i: number): Block | null {
++    const b = compileBlock(pc, this.m32, this.bus.ramBase, this.bus.ramSize);
++    this.tags[i] = pc;
++    this.blocks[i] = b;
++    if (b) {
++      this.compiled++;
++      this.allBlocks.set(pc, b);
++      const off = ((pc - (this.bus.ramBase | 0)) | 0) >>> 0;
++      const page = off >>> CODE_PAGE_SHIFT; // un bloque nunca cruza de página
++      this.codePages[page] = 1;
++      (this.pageBlocks[page] ??= []).push(pc);
++    }
++    return b;
++  }
++
+   /** Lo activan CSR, MRET y WFI para devolver el control a la máquina. */
+   private breakOut = false;
+ 
+@@ -347,7 +454,7 @@
+    * una instrucción lanza un Trap: `finally`) y antes de las instrucciones SYSTEM, que leen
+    * los contadores. Capítulo 8 del curso.
+    */
+-  private runInner(budget: number): number {
++  private runInner(budget: number, untilJump: boolean): number {
+     const x = this.x;
+     const m8 = this.m8, m16 = this.m16, m32 = this.m32;
+     const u8 = this.bus.ram;
+@@ -356,6 +463,7 @@
+     const ramBase = this.bus.ramBase | 0;
+     const ramSize = this.bus.ramSize;
+     const ramLimit = ramSize - 4;
++    const code = this.codePages;
+     let pc = this.pc;
+     let n = 0;
+     let flushed = 0; // instrucciones ya sumadas a instret/cycle
+@@ -369,34 +477,33 @@
+         const rd = (insn >>> 7) & 31;
+         let next = (pc + 4) | 0;
+ 
+-        // Los 2 bits bajos de toda instrucción de 32 bits valen 11; los 5 siguientes eligen el grupo.
+-        // Un switch sobre 0..31 (denso) se compila como tabla de saltos, no como cadena de if.
+-        if ((insn & 3) !== 3) throw new Trap(CAUSE.ILLEGAL_INSTRUCTION, insn);
+-        switch ((insn >>> 2) & 31) {
+-          case 13: // LUI (0x37)
++        switch (insn & 0x7f) {
++          case 0x37: // LUI
+             if (rd) x[rd] = insn & 0xfffff000;
+             break;
+-          case 5: // AUIPC (0x17)
++          case 0x17: // AUIPC
+             if (rd) x[rd] = (pc + (insn & 0xfffff000)) | 0;
+             break;
+-          case 27: { // JAL (0x6f)
++          case 0x6f: { // JAL
+             const imm = ((insn >> 31) << 20) | (((insn >>> 12) & 0xff) << 12) |
+               (((insn >>> 20) & 1) << 11) | (((insn >>> 21) & 0x3ff) << 1);
+             const target = (pc + imm) | 0;
+             if (target & 3) throw new Trap(CAUSE.MISALIGNED_FETCH, target);
+             if (rd) x[rd] = next;
+             next = target;
++            if (untilJump) { pc = next; return ++n; }
+             break;
+           }
+-          case 25: { // JALR (0x67)
++          case 0x67: { // JALR
+             if ((insn & 0x7000) !== 0) throw new Trap(CAUSE.ILLEGAL_INSTRUCTION, insn);
+             const target = ((x[(insn >>> 15) & 31] + (insn >> 20)) & ~1) | 0;
+             if (target & 3) throw new Trap(CAUSE.MISALIGNED_FETCH, target);
+             if (rd) x[rd] = next;
+             next = target;
++            if (untilJump) { pc = next; return ++n; }
+             break;
+           }
+-          case 24: { // BRANCH (0x63)
++          case 0x63: { // BRANCH
+             const a = x[(insn >>> 15) & 31], b = x[(insn >>> 20) & 31];
+             let taken: boolean;
+             switch ((insn >>> 12) & 7) {
+@@ -415,9 +522,10 @@
+               if (target & 3) throw new Trap(CAUSE.MISALIGNED_FETCH, target);
+               next = target;
+             }
++            if (untilJump) { pc = next; return ++n; }
+             break;
+           }
+-          case 0: { // LOAD (0x03): ruta rápida si es RAM y está alineado; si no, el método general
++          case 0x03: { // LOAD: ruta rápida si es RAM y está alineado; si no, el método general
+             const addr = (x[(insn >>> 15) & 31] + (insn >> 20)) | 0;
+             const off = ((addr - ramBase) | 0) >>> 0;
+             let v: number;
+@@ -432,7 +540,7 @@
+             if (rd) x[rd] = v;
+             break;
+           }
+-          case 8: { // STORE (0x23)
++          case 0x23: { // STORE
+             const imm = ((insn >> 25) << 5) | ((insn >>> 7) & 31);
+             const addr = (x[(insn >>> 15) & 31] + imm) | 0;
+             const v = x[(insn >>> 20) & 31];
+@@ -443,11 +551,13 @@
+               case 2: if ((off & 3) === 0 && off <= ramLimit) m32[off >>> 2] = v; else this.store32(addr, v); break;
+               default: throw new Trap(CAUSE.ILLEGAL_INSTRUCTION, insn);
+             }
++            // Si la página tiene bloques compilados, quedan viejos (ver jit.ts).
++            if (off < ramSize && code[off >>> CODE_PAGE_SHIFT] !== 0) this.codeWrite(off);
+             // Cualquier escritura a la palabra reservada rompe la reserva de LR.
+             if (this.reservation === (addr & ~3)) this.reservation = -1;
+             break;
+           }
+-          case 4: { // OP-IMM (0x13)
++          case 0x13: { // OP-IMM
+             const imm = insn >> 20;
+             const a = x[(insn >>> 15) & 31];
+             const sh = imm & 31;
+@@ -473,7 +583,7 @@
+             if (rd) x[rd] = v;
+             break;
+           }
+-          case 12: { // OP (0x33) (incluye la extensión M)
++          case 0x33: { // OP (incluye la extensión M)
+             const a = x[(insn >>> 15) & 31], b = x[(insn >>> 20) & 31];
+             const f7 = insn >>> 25;
+             let v: number;
+@@ -513,10 +623,11 @@
+             if (rd) x[rd] = v;
+             break;
+           }
+-          case 3: // MISC-MEM (0x0f): FENCE y FENCE.I no hacen nada con un solo hart sin cachés
++          case 0x0f: // MISC-MEM: FENCE y FENCE.I no hacen nada con un solo hart sin cachés
++            // (los bloques compilados ya se invalidan en cada escritura a su página: ver jit.ts)
+             if (((insn >>> 12) & 7) > 1) throw new Trap(CAUSE.ILLEGAL_INSTRUCTION, insn);
+             break;
+-          case 28: { // SYSTEM (0x73): vuelca el estado local, porque lee contadores y puede saltar
++          case 0x73: { // SYSTEM: vuelca el estado local, porque lee contadores y puede saltar
+             this.pc = pc;
+             this.instret += n - flushed;
+             this.cycle += n - flushed;
+@@ -525,7 +636,7 @@
+             if (this.breakOut) { pc = next; n++; return n; }
+             break;
+           }
+-          case 11: // AMO (0x2f) (extensión A)
++          case 0x2f: // AMO (extensión A)
+             this.atomic(insn, rd, (insn >>> 15) & 31, (insn >>> 20) & 31, (insn >>> 12) & 7);
+             break;
+           default:
